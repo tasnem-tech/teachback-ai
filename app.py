@@ -553,6 +553,59 @@ def diagnostic_question(selected: str, misses: List[str], context: str) -> Tuple
     return q, reference
 
 
+
+
+def score_challenge_answer(reference: str, answer: str, weak_idea: str, mode: str = "Fast") -> Tuple[float, str]:
+    """Score a focused diagnostic answer without expecting the learner to restate the whole concept."""
+    # Lexical similarity gives a small signal, while targeted idea coverage matters more.
+    vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
+    try:
+        mat = vec.fit_transform([reference, answer])
+        similarity = float(cosine_similarity(mat[0], mat[1])[0, 0])
+    except ValueError:
+        similarity = 0.0
+
+    a = _normalise_learning_language(answer)
+    weak = _normalise_learning_language(weak_idea)
+
+    weak_terms = [
+        w for w in re.findall(r"\b[a-zA-Z][a-zA-Z\-]{3,}\b", weak)
+        if w not in STOPWORDS and w not in {"such", "ways", "idea", "important"}
+    ]
+    target_cov = (sum(term in a for term in weak_terms) / max(1, len(weak_terms))) if weak_terms else 0.0
+
+    # Reward a clear cause/consequence connection in diagnostic answers.
+    consequence_markers = [
+        "new data", "unseen data", "new examples", "unseen examples",
+        "performs worse", "perform worse", "poorly", "generalisation", "generalization"
+    ]
+    consequence = 1.0 if any(marker in a for marker in consequence_markers) else 0.0
+
+    # Common equivalent wording for training-specific noise / irrelevant patterns.
+    if any(x in weak for x in ["noise", "irrelevant patterns", "spurious patterns"]):
+        idea_hit = 1.0 if any(x in a for x in ["noise", "irrelevant patterns", "spurious patterns", "random patterns"]) else target_cov
+    else:
+        idea_hit = target_cov
+
+    sim_norm = min(1.0, similarity / 0.30)
+    score = 100.0 * (0.25 * sim_norm + 0.50 * idea_hit + 0.25 * consequence)
+
+    # A focused answer that clearly states the weak idea and consequence should read as strong.
+    if idea_hit >= 0.75 and consequence >= 1.0:
+        score = max(score, 82.0)
+    elif idea_hit >= 0.50:
+        score = max(score, 68.0)
+
+    if mode == "Deep analysis":
+        model = load_semantic_model()
+        if model is not None:
+            emb = model.encode([reference, answer], normalize_embeddings=True, show_progress_bar=False)
+            semantic = max(0.0, min(100.0, (float(np.dot(emb[0], emb[1])) - 0.10) / 0.65 * 100.0))
+            score = 0.65 * score + 0.35 * semantic
+            return max(0.0, min(100.0, score)), "Focused diagnostic + Sentence-BERT"
+
+    return max(0.0, min(100.0, score)), "Focused diagnostic scoring"
+
 def challenge_feedback(score: float) -> str:
     if score >= 75:
         return "Strong answer — you connected the weak idea back to the concept."
@@ -945,6 +998,7 @@ with tab1:
                     "mismatch": mismatch,
                     "challenge_question": challenge_q,
                     "challenge_reference": challenge_ref,
+                    "challenge_weak_idea": misses[0] if misses else selected,
                 }
                 st.session_state.challenge_result = None
 
@@ -1005,11 +1059,11 @@ with tab1:
                 if len(challenge_answer.strip().split()) < 6:
                     st.warning("Give a short explanation, not just one or two words.")
                 else:
-                    challenge_score, _ = semantic_score(
+                    challenge_score, _ = score_challenge_answer(
                         result["challenge_reference"],
                         challenge_answer,
+                        result.get("challenge_weak_idea", selected),
                         analysis_mode,
-                        selected,
                     )
                     st.session_state.challenge_result = {
                         "concept": selected,
